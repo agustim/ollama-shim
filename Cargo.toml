@@ -1,5 +1,5 @@
 [package]
-name = "ollama-api-proxy"
+name = "ollama-shim"
 version = "0.1.0"
 edition = "2024"
 
@@ -15,6 +15,7 @@ hyper = "1.8"
 axum-server = "0.8"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 anyhow = "1.0.102"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 anyhow = "1.0.102"

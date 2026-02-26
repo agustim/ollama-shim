@@ -14,7 +14,7 @@ pub async fn proxy_handler(
     req: Request<Body>,
 ) -> impl IntoResponse {
     let headers = req.headers().clone();
-    let method = req.method().clone();
+    let method: Method = req.method().clone();
     // consume body with an arbitrary max size
     let body = req.into_body();
     let body_bytes = match body::to_bytes(body, 8 * 1024 * 1024).await {
@@ -38,7 +38,7 @@ pub async fn proxy_handler(
 
 pub async fn forward_request(
     state: &AppState,
-    method: hyper::Method,
+    method: Method,
     path: String,
     headers: HeaderMap,
     body: Bytes,

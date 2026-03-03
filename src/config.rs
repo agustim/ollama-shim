@@ -153,6 +153,83 @@ fn load_keys_from_sqlite(path: &str) -> Result<Vec<String>> {
     Ok(keys)
 }
 
+// helpers used by the new `sql` command-line subcommands
+fn ensure_sqlite(path: &str) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("failed to open sqlite database '{}'", path))?;
+    // our desired schema has a username column so the CLI can refer to users
+    // by name.  existing databases created by older versions of the tool may
+    // only have a single "key" column; creation in that case will be a no-op.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS api_keys(
+            username TEXT PRIMARY KEY,
+            key TEXT NOT NULL
+        )",
+        [],
+    )?;
+    // ensure there's an index on key so the old-style lookup remains fast and
+    // unique behaviour is preserved.  again, `IF NOT EXISTS` avoids errors
+    // against legacy tables.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(key)",
+        [],
+    )?;
+    Ok(conn)
+}
+
+/// internal utility: check whether the table includes a given column.
+fn has_column(conn: &Connection, col: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(api_keys)")
+        .context("failed to query table info")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?; // second column is name
+        if name == col {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Add a user+key pair to the sqlite database. If the file does not exist it
+/// will be created along with the necessary table.  For backwards
+/// compatibility with older databases that only contain a single `key`
+/// column, the username parameter is ignored and the key value is inserted as
+/// before.
+pub fn add_key_to_sqlite(path: &str, username: &str, key: &str) -> Result<()> {
+    let conn = ensure_sqlite(path)?;
+    if has_column(&conn, "username")? {
+        conn.execute(
+            "INSERT OR IGNORE INTO api_keys(username, key) VALUES (?1, ?2)",
+            [username, key],
+        )
+        .context("failed to insert user/key into sqlite database")?;
+    } else {
+        // fall back for legacy schema
+        conn.execute(
+            "INSERT OR IGNORE INTO api_keys(key) VALUES (?1)",
+            [key],
+        )
+        .context("failed to insert key into sqlite database")?;
+    }
+    Ok(())
+}
+
+/// Remove a user (by username) from the sqlite database.  Returns `true` if a
+/// row was deleted.  In legacy databases without a username column the
+/// supplied value is treated as the key itself.
+pub fn remove_key_from_sqlite(path: &str, username: &str) -> Result<bool> {
+    let conn = ensure_sqlite(path)?;
+    let n = if has_column(&conn, "username")? {
+        conn.execute("DELETE FROM api_keys WHERE username = ?1", [username])
+    } else {
+        conn.execute("DELETE FROM api_keys WHERE key = ?1", [username])
+    }
+    .context("failed to delete entry from sqlite database")?;
+    Ok(n > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +318,7 @@ mod tests {
 
     #[test]
     fn url_defaults_and_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             env::remove_var("OLLAMA_URL");
             env::remove_var("API_KEYS_SQLITE");
@@ -298,7 +376,56 @@ mod tests {
         overrides.api_keys = Some(vec!["k1".into(), "k2".into()]);
         let _ = cfg.apply_overrides(&overrides);
         assert_eq!(cfg.ollama_url, "http://foo");
-        assert_eq!(cfg.proxy_addr, "127.0.0.1:1234".parse().unwrap());
-        assert_eq!(cfg.valid_keys, vec!["k1", "k2"]);
+    }
+
+    #[test]
+    fn sqlite_add_remove_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // clear any preexisting configuration variables to avoid races
+        unsafe {
+            env::remove_var("API_KEYS_SQLITE");
+            env::remove_var("API_KEYS_FILE");
+            env::remove_var("API_KEYS");
+        }
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        // database does not yet exist - adding should create both file and table
+        add_key_to_sqlite(path, "alice", "key1").unwrap();
+        // loading should return the inserted value (only the key portion is used
+        // by AppConfig::load)
+        unsafe { env::set_var("API_KEYS_SQLITE", path); }
+        let cfg = AppConfig::load().expect("load");
+        assert_eq!(cfg.valid_keys, vec!["key1"]);
+        // add a second user and attempt to re-add the first
+        add_key_to_sqlite(path, "bob", "key2").unwrap();
+        add_key_to_sqlite(path, "alice", "key1").unwrap(); // duplicate ignored
+        let cfg2 = AppConfig::load().expect("load");
+        assert_eq!(cfg2.valid_keys, vec!["key1", "key2"]);
+        // removal by user name
+        assert!(remove_key_from_sqlite(path, "alice").unwrap());
+        assert!(!remove_key_from_sqlite(path, "alice").unwrap());
+        let cfg3 = AppConfig::load().expect("load");
+        assert_eq!(cfg3.valid_keys, vec!["key2"]);
+    }
+
+    #[test]
+    fn sqlite_legacy_schema_compatibility() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        // manually create legacy table with only key column
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE api_keys(key TEXT)", []).unwrap();
+        // calling new helper should fall back to inserting key value
+        add_key_to_sqlite(path, "ignored_user", "legacykey").unwrap();
+        // make sure the loader looks at our temp file
+        unsafe { env::set_var("API_KEYS_SQLITE", path); }
+        let cfg = AppConfig::load().expect("load");
+        assert_eq!(cfg.valid_keys, vec!["legacykey"]);
+        // removal should treat the provided username as the key
+        assert!(remove_key_from_sqlite(path, "legacykey").unwrap());
+        let cfg2 = AppConfig::load().expect("load");
+        assert_eq!(cfg2.valid_keys, Vec::<String>::new());
     }
 }

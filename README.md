@@ -72,6 +72,32 @@ export PROXY_PORT="8080"
 The proxy listens on port `3000` (or whatever you specify with
 `PROXY_PORT` or `--proxy-port`).
 
+### Managing the SQLite API‑key database
+
+The binary now provides a small helper for manipulating a sqlite file that
+contains API keys. The same database format that the proxy reads can be
+created or modified with:
+
+```bash
+ollama-shim sql add-user <username> <api-key>   # creates file/table if needed
+ollama-shim sql del-user <username>             # removes the entry (exit code 2 if missing)
+```
+
+The username portion is stored alongside the key; the proxy itself only
+consumes the `key` values but the extra column makes it easier to manage
+different users.  Legacy databases that only contain key values continue to
+work and treat the username argument as the key.
+
+Both commands default to the path specified in the `API_KEYS_SQLITE`
+environment variable, or you can override it per‑invocation:
+
+```bash
+ollama-shim sql --sqlite=/var/lib/ollama/keys.db add-user key123
+```
+
+These helpers allow unattended scripts to keep an on‑disk key store in
+sync without having to write raw SQL or manage file creation manually.
+
 ## Testing
 
 The crate includes unit tests for configuration loading and request handling. Run them with `cargo test`.
